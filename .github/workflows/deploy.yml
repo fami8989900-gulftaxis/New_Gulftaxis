@@ -1,0 +1,55 @@
+name: Build & Package Gulf Taxis Dispatch Cloud
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install Frontend Dependencies
+      run: npm ci
+
+    - name: Build React Production Frontend
+      run: npm run build
+
+    - name: Assemble Hostinger Deployment Package
+      run: |
+        mkdir -p package_output/public_html
+        # Copy compiled static files
+        cp -r dist/* package_output/public_html/
+        # Copy .htaccess
+        cp deployment/public_html/.htaccess package_output/public_html/
+        # Copy setup wizard
+        cp deployment/public_html/setup.php package_output/public_html/
+        # Copy backend API files
+        mkdir -p package_output/backend
+        cp -r backend/* package_output/backend/
+        mkdir -p package_output/public_html/api
+        cp deployment/public_html/api/index.php package_output/public_html/api/
+        # Copy database migrations
+        mkdir -p package_output/database/migrations
+        cp -r database/migrations/* package_output/database/migrations/
+        # Create zip artifact
+        cd package_output && zip -r ../gulf-taxis-dispatch-cloud-hostinger.zip . && cd ..
+
+    - name: Upload Hostinger ZIP Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gulf-taxis-hostinger-deployment
+        path: gulf-taxis-dispatch-cloud-hostinger.zip
+        retention-days: 14

@@ -1,0 +1,6 @@
+{
+  "name": "Gulf Taxis Dispatch Cloud",
+  "description": "Hostinger-ready online transport dispatch management system for airport transfers, VIP fleets, and city transport.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
