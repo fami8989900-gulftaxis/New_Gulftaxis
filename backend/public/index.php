@@ -36,6 +36,7 @@ use GulfTaxis\Controllers\VehiclesController;
 use GulfTaxis\Controllers\ReportsController;
 use GulfTaxis\Controllers\BackupController;
 use GulfTaxis\Controllers\UsersController;
+use GulfTaxis\Controllers\MigrationController;
 use GulfTaxis\Utils\Response;
 
 // Global Headers & Security
@@ -173,6 +174,12 @@ if (preg_match('#^/api/v1/admin/users/(\d+)$#', $uri, $m) && ($method === 'PATCH
 }
 if ($uri === '/api/v1/admin/audit-logs' && $method === 'GET') {
     $users->auditLogs();
+}
+
+// Route: Automated & Controlled Database Migrations
+$migration = new MigrationController();
+if ($uri === '/api/v1/admin/migrate' && $method === 'POST') {
+    $migration->migrate();
 }
 
 // If no route matched

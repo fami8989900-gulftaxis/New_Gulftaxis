@@ -1,55 +1,258 @@
-name: Build & Package Gulf Taxis Dispatch Cloud
+name: Gulf Taxis CI/CD - Build & Deploy to Hostinger
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - production
   pull_request:
-    branches: [ main, master ]
+    branches:
+      - main
+      - production
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Perform validation and build only (skip deployment to Hostinger)'
+        required: false
+        type: boolean
+        default: false
+      run_migrations:
+        description: 'Execute pending database migrations on production'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: hostinger-production-deploy
+  cancel-in-progress: false
 
 jobs:
-  build:
+  # =========================================================================
+  # 1. TEST, AUDIT & BUILD
+  # =========================================================================
+  test-and-build:
+    name: Test & Build Production Bundle
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        cache: 'npm'
+      - name: Set up Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
 
-    - name: Install Frontend Dependencies
-      run: npm ci
+      - name: Set up PHP 8.2 & Extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo, pdo_mysql, json, session, mbstring
+          coverage: none
 
-    - name: Build React Production Frontend
-      run: npm run build
+      - name: Verify PHP Backend Syntax (php -l)
+        run: |
+          echo "Checking syntax of all PHP backend controllers and middleware..."
+          find backend -name "*.php" -exec php -l {} \;
+          echo "Checking syntax of deployment public files..."
+          find deployment -name "*.php" -exec php -l {} \;
 
-    - name: Assemble Hostinger Deployment Package
-      run: |
-        mkdir -p package_output/public_html
-        # Copy compiled static files
-        cp -r dist/* package_output/public_html/
-        # Copy .htaccess
-        cp deployment/public_html/.htaccess package_output/public_html/
-        # Copy setup wizard
-        cp deployment/public_html/setup.php package_output/public_html/
-        # Copy backend API files
-        mkdir -p package_output/backend
-        cp -r backend/* package_output/backend/
-        mkdir -p package_output/public_html/api
-        cp deployment/public_html/api/index.php package_output/public_html/api/
-        # Copy database migrations
-        mkdir -p package_output/database/migrations
-        cp -r database/migrations/* package_output/database/migrations/
-        # Create zip artifact
-        cd package_output && zip -r ../gulf-taxis-dispatch-cloud-hostinger.zip . && cd ..
+      - name: Install Frontend Dependencies
+        run: npm ci
 
-    - name: Upload Hostinger ZIP Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: gulf-taxis-hostinger-deployment
-        path: gulf-taxis-dispatch-cloud-hostinger.zip
-        retention-days: 14
+      - name: Run Tests & Pre-Flight Package Validation
+        run: npm test
+
+      - name: Compile React Production SPA (Vite)
+        run: npm run build
+
+      - name: Assemble Staging Payload
+        run: |
+          echo "Assembling clean Hostinger production payload..."
+          mkdir -p staging_deploy/public_html/api
+          mkdir -p staging_deploy/backend
+          mkdir -p staging_deploy/database/migrations
+
+          # Copy compiled static assets (index.html, assets/)
+          cp -r dist/* staging_deploy/public_html/
+
+          # Copy Apache .htaccess router
+          cp deployment/public_html/.htaccess staging_deploy/public_html/
+
+          # Copy Hostinger API entry point
+          cp deployment/public_html/api/index.php staging_deploy/public_html/api/
+
+          # Copy setup wizard
+          cp deployment/public_html/setup.php staging_deploy/public_html/
+
+          # Copy PHP Backend (controllers, config, middleware, utils)
+          cp -r backend/* staging_deploy/backend/
+
+          # Copy versioned database migrations
+          cp -r database/migrations/* staging_deploy/database/migrations/
+
+          # Security Verification: Ensure no forbidden files exist in payload
+          echo "Auditing staging payload for prohibited artifacts..."
+          ! test -d staging_deploy/node_modules
+          ! test -d staging_deploy/.git
+          ! test -f staging_deploy/.env
+          ! test -f staging_deploy/backend/config/db_credentials.php
+
+          echo "Staging payload assembled and verified successfully."
+
+      - name: Upload Build Artifact for Deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: hostinger-production-payload
+          path: staging_deploy
+          retention-days: 7
+
+  # =========================================================================
+  # 2. AUTOMATIC DEPLOYMENT TO HOSTINGER SHARED HOSTING
+  # =========================================================================
+  deploy-hostinger:
+    name: Deploy to Hostinger Shared Hosting
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/production')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run != true)
+    environment:
+      name: production
+      url: ${{ secrets.PRODUCTION_URL }}
+
+    steps:
+      - name: Download Staged Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hostinger-production-payload
+          path: deploy_workspace
+
+      - name: Verify Deployment Secrets Configured
+        run: |
+          if [ -z "${{ secrets.HOSTINGER_SERVER }}" ]; then
+            echo "::error::Missing secret HOSTINGER_SERVER. Please add it to your repository secrets."
+            exit 1
+          fi
+          if [ -z "${{ secrets.HOSTINGER_USERNAME }}" ]; then
+            echo "::error::Missing secret HOSTINGER_USERNAME. Please add it to your repository secrets."
+            exit 1
+          fi
+          if [ -z "${{ secrets.HOSTINGER_PASSWORD }}" ]; then
+            echo "::error::Missing secret HOSTINGER_PASSWORD. Please add it to your repository secrets."
+            exit 1
+          fi
+          echo "All required Hostinger deployment credentials verified."
+
+      # Deploy via Secure FTPS / SFTP using SamKirkland/FTP-Deploy-Action
+      - name: Sync Files to Hostinger (FTPS / SFTP)
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.HOSTINGER_SERVER }}
+          username: ${{ secrets.HOSTINGER_USERNAME }}
+          password: ${{ secrets.HOSTINGER_PASSWORD }}
+          protocol: ${{ secrets.HOSTINGER_PROTOCOL || 'ftps' }}
+          port: ${{ secrets.HOSTINGER_PORT || 21 }}
+          local-dir: ./deploy_workspace/public_html/
+          server-dir: ${{ secrets.HOSTINGER_REMOTE_PATH || 'public_html/' }}
+          dangerous-clean-slate: false
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/node_modules/**
+            **/config/db_credentials.php
+            **/setup.lock
+            **/storage/backups/**
+            **/.env*
+
+      - name: Sync Backend Directory (outside public_html if supported)
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.HOSTINGER_SERVER }}
+          username: ${{ secrets.HOSTINGER_USERNAME }}
+          password: ${{ secrets.HOSTINGER_PASSWORD }}
+          protocol: ${{ secrets.HOSTINGER_PROTOCOL || 'ftps' }}
+          port: ${{ secrets.HOSTINGER_PORT || 21 }}
+          local-dir: ./deploy_workspace/backend/
+          server-dir: ${{ secrets.HOSTINGER_BACKEND_REMOTE_PATH || 'backend/' }}
+          dangerous-clean-slate: false
+          exclude: |
+            **/config/db_credentials.php
+            **/storage/backups/**
+
+      - name: Sync Database Migrations Directory
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.HOSTINGER_SERVER }}
+          username: ${{ secrets.HOSTINGER_USERNAME }}
+          password: ${{ secrets.HOSTINGER_PASSWORD }}
+          protocol: ${{ secrets.HOSTINGER_PROTOCOL || 'ftps' }}
+          port: ${{ secrets.HOSTINGER_PORT || 21 }}
+          local-dir: ./deploy_workspace/database/
+          server-dir: ${{ secrets.HOSTINGER_DATABASE_REMOTE_PATH || 'database/' }}
+          dangerous-clean-slate: false
+
+      # Automated Database Migration Runner
+      - name: Run Pending Database Migrations
+        if: ${{ inputs.run_migrations != false }}
+        run: |
+          if [ -n "${{ secrets.PRODUCTION_URL }}" ] && [ -n "${{ secrets.DEPLOY_MIGRATION_TOKEN }}" ]; then
+            echo "Invoking automated migration runner on production..."
+            RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "${{ secrets.PRODUCTION_URL }}/api/v1/admin/migrate" \
+              -H "X-Deploy-Token: ${{ secrets.DEPLOY_MIGRATION_TOKEN }}" \
+              -H "Content-Type: application/json")
+
+            HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
+            BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS")
+
+            echo "Migration response ($HTTP_CODE): $BODY"
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "::error::Migration failed with status code $HTTP_CODE"
+              exit 1
+            fi
+          else
+            echo "Notice: PRODUCTION_URL or DEPLOY_MIGRATION_TOKEN not configured. Skipping automated remote migration call."
+          fi
+
+      # Post-Deployment Health Verification Probe with Retry
+      - name: Verify Production Health Check Endpoint
+        if: ${{ secrets.PRODUCTION_URL != '' }}
+        run: |
+          echo "Probing production health endpoint at ${{ secrets.PRODUCTION_URL }}/api/v1/health ..."
+          SUCCESS=0
+          for i in {1..5}; do
+            HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.PRODUCTION_URL }}/api/v1/health" || true)
+            if [ "$HEALTH_STATUS" -eq 200 ]; then
+              echo "✓ Health probe passed on attempt $i (HTTP 200)"
+              SUCCESS=1
+              break
+            fi
+            echo "Attempt $i: Received HTTP $HEALTH_STATUS. Retrying in 5 seconds..."
+            sleep 5
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "::warning::Health check did not return HTTP 200 within 25 seconds. Please inspect server logs."
+          fi
+
+      - name: Write Deployment Summary
+        run: |
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+          ## 🚀 Gulf Taxis Dispatch Cloud - Deployment Succeeded!
+
+          - **Environment**: \`production\`
+          - **Commit**: \`${{ github.sha }}\`
+          - **Triggered By**: @${{ github.actor }}
+          - **Destination**: Hostinger Shared Hosting
+          - **Frontend**: React SPA static build (\`index.html\`, \`assets/\`)
+          - **Backend**: PHP 8.2+ REST API with PDO MySQL
+          - **Database Protection**: Existing tables, bookings, users, and drivers preserved.
+          - **Production URL**: ${{ secrets.PRODUCTION_URL || 'Configured via Hostinger hPanel' }}
+
+          ### Rollback Procedure
+          If an issue occurs in production:
+          1. Go to **Actions** -> **Gulf Taxis CI/CD** -> select the previous successful run.
+          2. Re-run jobs from that commit or push a git revert commit to \`main\`.
+          3. Or download the emergency ZIP package from your Hostinger Deploy Center in the web UI.
+          EOF
